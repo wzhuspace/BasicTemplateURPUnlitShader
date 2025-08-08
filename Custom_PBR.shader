@@ -56,23 +56,23 @@ Shader "Wen/CustomPBR"
             #define EPSILON 1e-6
 
             // ------------------------------------ Universal Render Pipeline keywords------------------------------------
-            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
-            #pragma multi_compile _ _ADDITIONAL_LIGHTS_VERTEX _ADDITIONAL_LIGHTS
-            #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
-            #pragma multi_compile_fragment _ _REFLECTION_PROBE_BLENDING
-            #pragma multi_compile_fragment _ _REFLECTION_PROBE_BOX_PROJECTION
-            #pragma multi_compile_fragment _ _SHADOWS_SOFT
-            #pragma multi_compile_fragment _ _SCREEN_SPACE_OCCLUSION
+            #pragma multi_compile  _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN 
+            #pragma multi_compile _ADDITIONAL_LIGHTS_VERTEX _ADDITIONAL_LIGHTS _ADDITIONAL_LIGHT_SHADOWS
+            #pragma multi_compile_fragment  _REFLECTION_PROBE_BLENDING _REFLECTION_PROBE_BOX_PROJECTION
+            #pragma multi_compile_fragment  _SHADOWS_SOFT
+            #pragma multi_compile_fragment _SCREEN_SPACE_OCCLUSION
             #pragma shader_feature_local_fragment _EMISSION
             
             // ------------------------------------ TEXTURE ------------------------------------
+           
+// ------------------------------------ TEXTURE ------------------------------------
             TEXTURE2D(_Albedo); SAMPLER(sampler_Albedo);
-            TEXTURE2D(_EmissionMap); 
-            TEXTURE2D(_NormalMap); 
-            TEXTURE2D(_MetalnessMap); 
-            TEXTURE2D(_RoughnessMap); 
-            TEXTURE2D(_OcclusionMap); 
-            TEXTURE2D(_IBLMap); 
+            TEXTURE2D(_EmissionMap); SAMPLER(sampler_EmissionMap);
+            TEXTURE2D(_NormalMap); SAMPLER(sampler_NormalMap);
+            TEXTURE2D(_MetalnessMap); SAMPLER(sampler_MetalnessMap);
+            TEXTURE2D(_RoughnessMap); SAMPLER(sampler_RoughnessMap);
+            TEXTURE2D(_OcclusionMap); SAMPLER(sampler_OcclusionMap);
+            TEXTURE2D(_IBLMap); SAMPLER(sampler_IBLMap);
 
             // ------------------------------------ FLOAT ------------------------------------
             CBUFFER_START(UnityPerMaterial)
@@ -134,15 +134,17 @@ Shader "Wen/CustomPBR"
 
                 // --------------- INPUTS: VECTOR ----------------
                 float3 viewDir = GetWorldSpaceNormalizeViewDir(input.positionWS); //V
-                Light mainLight = GetMainLight();
+                
+                float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS);
+                Light mainLight = GetMainLight(shadowCoord);
                 float3 lightDir = normalize(mainLight.direction); //L
                 float3 halfwayVector = normalize(lightDir + viewDir); // H:halfway Vector
 
                 // Normal 
-                half3 worldNormal = normalize(input.normalWS);
+                half3 normalWS = normalize(input.normalWS);
                 half3 worldTangent = normalize(input.tangentWS.xyz);
-                half3 worldBiNormal = normalize(cross(worldNormal, worldTangent)) * input.tangentWS.w;
-                half3x3 TBN = half3x3(worldTangent, worldBiNormal, worldNormal);
+                half3 worldBiNormal = normalize(cross(normalWS, worldTangent)) * input.tangentWS.w;
+                half3x3 TBN = half3x3(worldTangent, worldBiNormal, normalWS);
                 //-------------------------------------------------------
 
                 // --------------- INPUTS: TEXTURE ----------------
@@ -161,65 +163,52 @@ Shader "Wen/CustomPBR"
                 // Emission
                 float3 emission = float3(0.0, 0.0, 0.0);
                 #ifdef _EMISSION
-                        emission = SAMPLE_TEXTURE2D(_EmissionMap, sampler_Albedo, uv).rgb * _EmissionColor.rgb;
+                        emission = SAMPLE_TEXTURE2D(_EmissionMap, sampler_EmissionMap, uv).rgb * _EmissionColor.rgb;
                 #endif
  
                 // Convert Normal Map and GET Normal in World Space
-                float3 normalTS = UnpackNormalScale(SAMPLE_TEXTURE2D(_NormalMap, sampler_Albedo, uv), _NormalScale);
-                worldNormal = normalize(mul(normalTS, TBN)); // Transform normal from tangent space to world space
+                float3 normalTS = UnpackNormalScale(SAMPLE_TEXTURE2D(_NormalMap, sampler_NormalMap, uv), _NormalScale);
+                normalWS = normalize(mul(normalTS, TBN)); // Transform normal from tangent space to world space
                 
                 // Roughness
-                float roughness = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_Albedo, uv).r * _Roughness;
+                float roughness = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, uv).r * _Roughness;
                 roughness = max(0.04, min(0.99, roughness)); // Clamp roughness to avoid division by zero in NDF calculation
                 // Metallic
-                float metallic = SAMPLE_TEXTURE2D(_MetalnessMap, sampler_Albedo, uv).r;
+                float metallic = SAMPLE_TEXTURE2D(_MetalnessMap, sampler_MetalnessMap, uv).r;
                 metallic = saturate(metallic * _Metalness);
                 // Occlusion
-                float occlusion = SAMPLE_TEXTURE2D(_OcclusionMap, sampler_Albedo, uv).r;
+                float occlusion = SAMPLE_TEXTURE2D(_OcclusionMap, sampler_OcclusionMap, uv).r;
                 occlusion = lerp(1.0, occlusion, _Occlusion); 
                 
                 // -------------------- BRDF --------------------------
+                float NdotV = max(dot(normalWS, viewDir), EPSILON);
+                float NdotL = max(dot(normalWS, lightDir), EPSILON);
+                
                 // Part 1: Normal Distribution Function (NDF)
-                float NDF = DistributionGGX(worldNormal, halfwayVector, roughness);
-                
+                float NDF = DistributionGGX(normalWS, halfwayVector, roughness);
                 // Part 2: Geometry Function
-                float GS = GeometrySmith(worldNormal, viewDir, lightDir, roughness);
-                
+                float GS = GeometrySmith(normalWS, viewDir, lightDir, roughness);
                 // Part 3: Fresnel Function
-                float HdotV = max(dot(halfwayVector, viewDir), EPSILON); // max(EPSILON) makes sure the output is not negative
-                
-                // f0 lerp between 0.04 and albedo color based on metallic value
-                float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
-                float3 F = FresnelSchlick(HdotV, F0);
+                float3 F0 = float3(0.04, 0.04, 0.04); // Default F0 for dielectrics
+                F0 = lerp(F0, albedo.rgb, metallic);
+                float3 F = FresnelSchlick(NdotV, F0); // Fresnel term based on view direction and normal
                 
                 // ----- Part 4: Final BRDF Calculation -----
-                float NdotV = max(dot(worldNormal, viewDir), EPSILON);
-                float NdotL = max(dot(worldNormal, lightDir), EPSILON);
-
                 float3 nominator = NDF * GS * F;
-                float denominator = 4.0 * max(NdotV * NdotL, EPSILON) + 0.001;
-                // Adding a small value 0.001 to avoid division by zero
-                float3 specularBRDF = nominator / denominator;
-    
-                // --------------------- POST-PROCESS SCREEN OCCLUSION-------------------------------
-                float2 screenUV = GetNormalizedScreenSpaceUV(input.positionCS); // for screen space ambient occlusion - post process
-                #if defined(_SCREEN_SPACE_OCCLUSION)
-                    AmbientOcclusionFactor aoFactor = GetScreenSpaceAmbientOcclusion(screenUV);
-                    occlusion = min(occlusion,aoFactor.indirectAmbientOcclusion);
-                #endif
-
-                // -------------- PART 1 : Direct lighting calculation -------------- 
+                float denominator = max(4.0 * NdotV * NdotL, EPSILON);
+                //float denominator = 4.0 * max(NdotV * NdotL, EPSILON) + 0.001;
+                float3 brdfSpec = nominator / denominator;
+                
+                // -------------- PART 1 : Direct lighting calculation --------------
                 float3 kS = F;
-                float3 kD = (1 - kS) * (1 - metallic); // Diffuse term is affected by metallic value 
+                float3 kD = (1 - kS) * (1 - metallic); // Diffuse term is affected by metallic value
                 float3 diffuse = albedo.rgb * kD; // * Note: diffuse NOT equal to albedo in metallic materials
-                float3 radianceLo = _MainLightColor.rgb * NdotL; // 有效入射光能
-                float shadow = mainLight.shadowAttenuation;
-                float3 directLighting = (diffuse / PI + specularBRDF) * radianceLo * shadow;
-                // ----------------------------------------------------
+                float3 radiance = _MainLightColor.rgb * mainLight.shadowAttenuation; // Incoming light energy
+                float3 directDiffuse = (diffuse / PI + brdfSpec) * radiance * NdotL;
+                // -------------------------------------------------------------------
 
                 // ------------- Additional Direct Lighting calculation -------------
                 float3 additionalLights = float3(0.0, 0.0, 0.0);
-                
                 #ifdef _ADDITIONAL_LIGHTS
                 uint pixelLightCount = GetAdditionalLightsCount();
                 
@@ -232,13 +221,13 @@ Shader "Wen/CustomPBR"
                     half3 addlightColor = additionalLight.color;
                     half3 addH = normalize(addLDir + viewDir);
                     half addShadow  = additionalLight.shadowAttenuation * additionalLight.distanceAttenuation;
-                    float addNDF = DistributionGGX(worldNormal, addH, roughness);
-                    float addGS = GeometrySmith(worldNormal, viewDir, addLDir, roughness);
+                    float addNDF = DistributionGGX(normalWS, addH, roughness);
+                    float addGS = GeometrySmith(normalWS, viewDir, addLDir, roughness);
                     float addHdotV = max(dot(addH, viewDir), EPSILON);
                     float3 addF0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
                     float3 addF = FresnelSchlick(addHdotV, addF0);
-                    float addNdotV = max(dot(worldNormal, viewDir), EPSILON);
-                    float addNdotL = max(dot(worldNormal, addLDir), EPSILON);
+                    float addNdotV = max(dot(normalWS, viewDir), EPSILON);
+                    float addNdotL = max(dot(normalWS, addLDir), EPSILON);
                     float3 addNominator = addNDF * addGS * addF;
                     float addDenominator = 4.0 * max(addNdotV * addNdotL, EPSILON) + 0.001; // Avoid division by zero
                     
@@ -253,30 +242,39 @@ Shader "Wen/CustomPBR"
                 }
                 #endif
                 
-                directLighting = directLighting + additionalLights;
+                directDiffuse = directDiffuse + additionalLights;
+
+                // --------------------- POST-PROCESS SCREEN OCCLUSION-------------------------------
+                float2 screenUV = GetNormalizedScreenSpaceUV(input.positionCS); // for screen space ambient occlusion - post process
+                #if defined(_SCREEN_SPACE_OCCLUSION)
+                    AmbientOcclusionFactor aoFactor = GetScreenSpaceAmbientOcclusion(screenUV);
+                    occlusion = min(occlusion,aoFactor.indirectAmbientOcclusion);
+                #endif
                 
-                // ---------------  PART 2: Indirect lighting calculation --------------
-                // ----- Diffuse irradiance 球谐函数中采样环境光照 -> 辐照度图作为光照的间接漫反射部分 -----
-                // Normal Based -> Normal faces upwards of the surface reflect the environment light color, vice versa
-                float3 diffuseIrradiance = SampleSH(worldNormal) * occlusion * diffuse; //Ambient Diffuse Light
-
-                // ----- Specular IBL: Image Based Lightning-----
+                // ---------------  PART 2: Indirect lighting calculation -------------
+                // -------------------- Ambient Diffuse ------------------------------
+                // Normal Based Normal faces upwards of the surface reflect the skybox light color, face down reflect ground color
+                float3 diffuseIrradiance = SampleSH(normalWS); // Spherical Harmonics (SH)
+                float3 F_IBL = FresnelSchlickRoughness(NdotV, F0, roughness); //Ambient Fresnel
+                float3 ambientKD = (1.0 - F_IBL) * (1 - metallic);
+                float3 ambientDiffuse = diffuseIrradiance * (ambientKD * albedo.rgb) * occlusion;
+                
+                // -------------------- Ambient Specular ------------------------------
                 float mipLevel = roughness * 6.0; // Roughness to mip level
-
-                float3 R = reflect(-viewDir, worldNormal); // Reflect view direction around normal 反射方向
-                // 在URP中，environment cube采样函数会自动处理HDR解码
-                float3 envSample = SAMPLE_TEXTURECUBE_LOD(unity_SpecCube0, samplerunity_SpecCube0, R, mipLevel).rgb;
+                float3 R = reflect (-viewDir, normalWS) ; // Reflect view direction around normal 
+                // Sample Environment Cube Map
+                float3 prefilteredColor = SAMPLE_TEXTURECUBE_LOD(unity_SpecCube0, samplerunity_SpecCube0, R, mipLevel).rgb;
                 // Sample environment map
-                float3 F_IBL = FresnelSchlickRoughness(NdotV, F0, roughness); // Indirect Fresnel 间接光菲涅尔
-                float2 envBRDF = SAMPLE_TEXTURE2D(_IBLMap, sampler_Albedo, float2(NdotV, roughness)).rg;
-                // Ambient Specular Light
-                float3 ambientSpecular = envSample * (F_IBL * envBRDF.x + envBRDF.y) * occlusion;
+                float2 envBRDF = SAMPLE_TEXTURE2D(_IBLMap, sampler_IBLMap, float2(NdotV, roughness)).rg;
+                float3 ambientSpecular = prefilteredColor * (F_IBL * envBRDF.x + envBRDF.y) * occlusion;
                 // ----------------------------------------------------
 
                 // -------------------- FINAL COLOR --------------------------
-                float4 finalColor = float4((directLighting + diffuseIrradiance + ambientSpecular + emission), 1.0);
+                float4 finalColor = float4((directDiffuse + ambientDiffuse + ambientSpecular + emission), 1.0);
 
                 return finalColor; // Return the final color
+                
+                return float4(envBRDF,0,1); // For debugging
             }
             
             ENDHLSL
